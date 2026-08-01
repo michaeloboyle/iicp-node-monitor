@@ -1,0 +1,18 @@
+# Never commit IICP secrets or local runtime state
+.iicp/
+*.node_token
+*operator_secret*
+*node_hmac*
+
+# local logs / history
+*.log
+metrics-history.jsonl
+events.jsonl
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# os
+.DS_Store

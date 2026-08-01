@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The plist `iicp-node service install` writes, plus two fixups it omits:
+     a PATH that includes cloudflared + iicp-node, and IICP_TUNNEL=1. Without
+     those the node advertises an unreachable endpoint. Replace __HOME__ with
+     your home dir. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>network.iicp.node.default</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IICP_NODE_NAME</key><string>default</string>
+    <key>IICP_SUPERVISED</key><string>1</string>
+    <key>IICP_TUNNEL</key><string>1</string>
+    <key>IICP_TUNNEL_DEAD_POLICY</key><string>auto</string>
+    <key>IICP_LOG_DIR</key><string>__HOME__/.iicp/logs</string>
+    <!-- PATH must include cloudflared (~/.local/bin) and iicp-node (~/.cargo/bin) -->
+    <key>PATH</key><string>__HOME__/.local/bin:__HOME__/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.cargo/bin/iicp-node</string>
+    <string>serve</string>
+    <string>--node</string>
+    <string>default</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__HOME__/.iicp/logs/network.iicp.node.default.out.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.iicp/logs/network.iicp.node.default.err.log</string>
+</dict>
+</plist>
