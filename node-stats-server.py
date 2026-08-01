@@ -24,6 +24,13 @@ HISTORY = os.path.join(LOGS, "metrics-history.jsonl")  # longitudinal samples of
 OPERATOR = os.path.join(IICP_DIR, "operator.json")
 DIRECTORY = "https://iicp.network/api"
 INTENT = "urn:iicp:intent:llm:chat:v1"
+# Curated intent probe list. There is no directory enumeration endpoint, so we
+# probe these and draw ONLY the ones with >=1 live provider (honest-dataviz: no
+# phantom functions). Add a (urn, short) pair here as the mesh grows new intents.
+INTENTS = [
+    ("urn:iicp:intent:llm:chat:v1", "llm:chat"),
+    ("urn:iicp:intent:llm:embedding:v1", "llm:embed"),
+]
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.log$")
 
 # event name -> cardiogram beat class
@@ -176,36 +183,43 @@ def network_snapshot():
                        "dist": mh.get("distribution", {})}
     except Exception:  # noqa: BLE001
         pass
-    try:
-        disc = _get(f"{DIRECTORY}/v1/discover?intent={INTENT}")
+    # Probe each curated intent; union the providers, annotating which intents
+    # each node serves. Only intents with >=1 provider are emitted.
+    node_map = {}   # node_id -> node dict (deduped across intents)
+    intents_out = []
+    for urn, short in INTENTS:
+        try:
+            disc = _get(f"{DIRECTORY}/v1/discover?intent={urn}")
+        except Exception as e:  # noqa: BLE001
+            out["error"] = str(e)
+            continue
+        ids = []
         for n in disc.get("nodes", []):
-            tp = n.get("trust_progress") or {}
-            pm = n.get("node_policy_manifest") or {}
-            perf = n.get("performance") or {}
-            out["nodes"].append({
-                "id": (n.get("node_id") or "")[:8],
-                "ours": n.get("node_id") == ours,
-                "region": n.get("region", "?"),
-                "health": n.get("health_label", "?"),
-                "reputation": n.get("reputation_tier", "?"),
-                "score": n.get("score", 0),
-                "tasks": tp.get("completed_tasks", 0),
-                "probation": n.get("probation"),
-                "models": n.get("models") or [],
-                "backend": n.get("backend", "?"),
-                "reachable": n.get("directory_observed_reachable"),
-                "operator": n.get("operator_display_name"),
-                "load": n.get("load", 0),
-                "active_jobs": n.get("active_jobs", 0),
-                "max_concurrent": n.get("max_concurrent"),
-                "sdk": n.get("sdk_version"),
-                "latency_ms": perf.get("task_latency_ms"),
-                "jurisdiction": pm.get("jurisdiction"),
-                "training_use": pm.get("training_use"),
-                "endpoint": n.get("endpoint", ""),
-            })
-    except Exception as e:  # noqa: BLE001
-        out["error"] = str(e)
+            nid = n.get("node_id") or ""
+            ids.append(nid[:8])
+            if nid not in node_map:
+                tp = n.get("trust_progress") or {}
+                pm = n.get("node_policy_manifest") or {}
+                perf = n.get("performance") or {}
+                node_map[nid] = {
+                    "id": nid[:8], "ours": nid == ours,
+                    "region": n.get("region", "?"), "health": n.get("health_label", "?"),
+                    "reputation": n.get("reputation_tier", "?"), "score": n.get("score", 0),
+                    "tasks": tp.get("completed_tasks", 0), "probation": n.get("probation"),
+                    "models": n.get("models") or [], "backend": n.get("backend", "?"),
+                    "reachable": n.get("directory_observed_reachable"),
+                    "operator": n.get("operator_display_name"), "load": n.get("load", 0),
+                    "active_jobs": n.get("active_jobs", 0), "max_concurrent": n.get("max_concurrent"),
+                    "sdk": n.get("sdk_version"), "latency_ms": perf.get("task_latency_ms"),
+                    "jurisdiction": pm.get("jurisdiction"), "training_use": pm.get("training_use"),
+                    "endpoint": n.get("endpoint", ""), "intents": [],
+                }
+            if short not in node_map[nid]["intents"]:
+                node_map[nid]["intents"].append(short)
+        if ids:
+            intents_out.append({"urn": urn, "short": short, "count": len(ids), "nodes": ids})
+    out["nodes"] = list(node_map.values())
+    out["intents"] = intents_out
     return out
 
 
@@ -524,13 +538,14 @@ html.ss,html.ss *{{cursor:none}}
     <span><span class="dot" style="background:var(--ok)"></span>healthy</span>
     <span><span class="dot" style="background:var(--warn)"></span>degraded</span>
     <span><span class="dot" style="background:var(--bad)"></span>critical/offline</span>
+    <span>inner ring = intents (functions) · edge color = intent a node serves</span>
     <span>size = score - ring = directory-observed reachable</span>
   </div></div>
 <div class="card" id="nodesdetail"><h2>Mesh nodes <span id="ndcount">-</span></h2>
   <div style="overflow-x:auto"><table class="nodes"><thead><tr>
     <th>node</th><th>region</th><th>health</th><th>rep</th><th>tasks</th><th>models</th>
-    <th>backend</th><th>load</th><th>lat</th><th>reach</th><th>juris</th>
-  </tr></thead><tbody id="nodetable"><tr><td colspan="11">loading…</td></tr></tbody></table></div></div>
+    <th>backend</th><th>load</th><th>lat</th><th>reach</th><th>juris</th><th>intents</th>
+  </tr></thead><tbody id="nodetable"><tr><td colspan="12">loading…</td></tr></tbody></table></div></div>
 <div class="card"><h2>Security posture</h2><table>{sec_rows}</table>
   <ul class="anom">{anom_html}</ul></div>
 <div class="card"><h2>This node</h2><table>{node_rows}</table></div>
@@ -599,23 +614,40 @@ function drawNet(){{
   const NW=NW0,NH=NH0,cx=NW/2,cy=NH/2;
   nx.clearRect(0,0,NW,NH);
   if(!netData){{requestAnimationFrame(drawNet);return;}}
-  const nodes=netData.nodes||[],R=Math.min(NW*0.30,NH*0.34);
+  const nodes=netData.nodes||[],R=Math.min(NW*0.30,NH*0.34),Ri=R*0.44;
+  const intents=netData.intents||[];
   const clip=s=>s&&s.length>16?s.slice(0,15)+'…':s;
   netPulse+=0.03;
-  // edges + hub
-  nodes.forEach((n,i)=>{{
-    const a=-Math.PI/2 + i/nodes.length*Math.PI*2;
-    const x=cx+Math.cos(a)*R,y=cy+Math.sin(a)*R;
-    nx.strokeStyle=col('--line');nx.lineWidth=n.ours?2:1;
-    nx.globalAlpha=n.ours?0.9:0.45;nx.beginPath();nx.moveTo(cx,cy);nx.lineTo(x,y);nx.stroke();nx.globalAlpha=1;
+  const icol=j=>[col('--accent'),'#3b82f6','#a855f7','#f59e0b','#10b981'][j%5];
+  // outer node positions, keyed by id (so intent edges can find them)
+  const npos={{}};
+  nodes.forEach((n,i)=>{{ const a=-Math.PI/2 + i/Math.max(nodes.length,1)*Math.PI*2;
+    npos[n.id]=[cx+Math.cos(a)*R, cy+Math.sin(a)*R]; }});
+  // intent positions on an inner ring
+  const ipos=intents.map((t,j)=>{{ const a=-Math.PI/2 + (j+0.5)/Math.max(intents.length,1)*Math.PI*2;
+    return [cx+Math.cos(a)*Ri, cy+Math.sin(a)*Ri]; }});
+  // edges: each intent -> the nodes that serve it (colored by intent)
+  intents.forEach((t,j)=>{{ const ip=ipos[j];
+    (t.nodes||[]).forEach(id=>{{ const p=npos[id]; if(!p)return;
+      nx.strokeStyle=icol(j);nx.globalAlpha=0.30;nx.lineWidth=1;
+      nx.beginPath();nx.moveTo(ip[0],ip[1]);nx.lineTo(p[0],p[1]);nx.stroke();nx.globalAlpha=1; }});
   }});
+  // edges: hub -> each intent (thick)
+  intents.forEach((t,j)=>{{ const ip=ipos[j];
+    nx.strokeStyle=icol(j);nx.globalAlpha=0.85;nx.lineWidth=2.5;
+    nx.beginPath();nx.moveTo(cx,cy);nx.lineTo(ip[0],ip[1]);nx.stroke();nx.globalAlpha=1; }});
+  // intent function nodes
+  intents.forEach((t,j)=>{{ const ip=ipos[j];
+    nx.fillStyle=icol(j);nx.beginPath();nx.arc(ip[0],ip[1],7,0,7);nx.fill();
+    nx.fillStyle=col('--fg');nx.font='700 11px ui-monospace,monospace';nx.textAlign='center';
+    nx.fillText(t.short+' ('+t.count+')',ip[0],ip[1]-12); }});
   // hub
-  nx.fillStyle=col('--accent');nx.beginPath();nx.arc(cx,cy,16,0,7);nx.fill();
-  nx.fillStyle=col('--fg');nx.font='700 15px -apple-system,sans-serif';nx.textAlign='center';
-  nx.fillText('iicp.network',cx,cy+36);
+  nx.fillStyle=col('--accent');nx.beginPath();nx.arc(cx,cy,14,0,7);nx.fill();
+  nx.fillStyle=col('--fg');nx.font='700 14px -apple-system,sans-serif';nx.textAlign='center';
+  nx.fillText('iicp.network',cx,cy+28);
   const mh=netData.mesh||{{}};
-  nx.fillStyle=col('--mut');nx.font='12px ui-monospace,monospace';
-  nx.fillText((mh.active_nodes||nodes.length)+' nodes - '+(mh.health||'')+' '+(mh.health_score||''),cx,cy+54);
+  nx.fillStyle=col('--mut');nx.font='11px ui-monospace,monospace';
+  nx.fillText((mh.active_nodes||nodes.length)+' nodes - '+(intents.length)+' intents',cx,cy+44);
   // nodes
   nodes.forEach((n,i)=>{{
     const a=-Math.PI/2 + i/nodes.length*Math.PI*2;
@@ -649,8 +681,8 @@ async function netPoll(){{
         +`<td title="${{models.join(', ')}}">${{mstr}}</td>`
         +`<td>${{n.backend}}</td><td>${{n.active_jobs}}/${{n.max_concurrent||'-'}}</td>`
         +`<td>${{lat}}</td><td>${{n.reachable===true?'yes':n.reachable===false?'no':'-'}}</td>`
-        +`<td>${{n.jurisdiction||'-'}}</td></tr>`;
-    }}).join('') || '<tr><td colspan="11">no nodes</td></tr>';
+        +`<td>${{n.jurisdiction||'-'}}</td><td>${{(n.intents||[]).join(', ')||'-'}}</td></tr>`;
+    }}).join('') || '<tr><td colspan="12">no nodes</td></tr>';
   }}catch(e){{}}
 }}
 netPoll();setInterval(netPoll,10000);requestAnimationFrame(drawNet);
