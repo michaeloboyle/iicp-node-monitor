@@ -17,8 +17,9 @@ monitor shows what the node is actually doing.
 Most node dashboards draw a moving waveform whether or not anything is happening.
 This one does not. Its design rule is a single constraint:
 
-> **The cardiogram is an honest impulse plot. Every mark maps to one real logged
-> event at its real timestamp. Nothing synthetic is ever drawn.**
+> **The cardiogram is an honest impulse plot. Node events retain their recorded
+> timestamps; derived directory observations are labelled separately and use the
+> time at which the monitor observed them. Nothing is backfilled as activity.**
 
 A flat baseline means the node is idle, the truth between roughly 30-second
 heartbeats. A green needle is a heartbeat, blue is a served task, amber is a
@@ -47,12 +48,10 @@ is drawn as a thin mesh rather than padded out.
 
 ![Security posture panel listing inbound surface, refused intents, origin masking, data exposure, and secret-at-rest state](docs/screenshots/security-posture.png)
 
-The panel reads the node's actual configuration and states plainly what is and is
-not exposed: the single inbound path, the refused `bash` and `write_file`
-intents, origin masking behind the tunnel, data exposure, concurrency, and
-whether the operator secret is encrypted at rest. Here it flags a plaintext
-secret in red instead of hiding it, because a monitor that only reports good news
-is not a security tool.
+The panel separates measured, configured, directory-reported, inferred and
+unavailable facts. It does not assume a Cloudflare tunnel, a particular tool
+policy, origin masking, model license or secret-storage mechanism. Unknown state
+is reported as unknown rather than converted into a reassuring claim.
 
 ### Trends over time
 
@@ -70,9 +69,29 @@ python3 node-stats-server.py --port 9486 --host 127.0.0.1
 open http://127.0.0.1:9486/
 ```
 
-It resolves the *current* node dynamically from `~/.iicp/logs/*.log`, so it
-survives the node-id and tunnel-URL rotation that happens on every restart.
-Nothing is hard-coded to a specific operator or endpoint.
+It resolves the current node dynamically from the configured IICP log directory,
+so it survives node-ID and endpoint rotation. Current directories are read through
+their privacy-bounded Registry API; older directories retain an explicitly partial
+discovery fallback.
+
+The monitor remains independent of the IICP project. It consumes public directory
+and node observability interfaces and does not sit in the task execution path.
+
+### Configuration
+
+```sh
+python3 node-stats-server.py \
+  --directory-url https://directory.example/api \
+  --log-dir ~/.iicp/logs \
+  --node-health-url http://127.0.0.1:9484/iicp/health \
+  --mode private
+```
+
+Equivalent environment variables are `IICP_DIRECTORY_URL`, `IICP_LOG_DIR`,
+`IICP_NODE_HEALTH_URL`, and `IICP_MODE`. Command-line values take precedence.
+Private and federated-private modes require an explicit directory. Local-only
+mode performs no directory requests. The monitor never silently falls back to
+the public Genesis directory for those modes.
 
 ### Endpoints
 
@@ -115,13 +134,45 @@ anything with stakes.
 
 ## Security notes
 
-- The monitor binds to loopback by default. It reads local logs and the public
-  directory; it never touches your operator secret or node token.
+- The monitor binds to loopback by default. A non-loopback bind exposes
+  operational metadata and prints a warning.
+- It reads configured local event and health files, public or explicitly selected
+  directory views, and the node health endpoint when configured. It never opens
+  the operator secret file or node token.
 - Never commit `~/.iicp/` contents. Tokens and the operator secret live there and
   stay there. This repo references their *location*, never their value.
 - A served node should offer only a public, open-weights model and refuse
   `bash` / `write_file` intents (the IICP default). Do not route private prompts
   to public mesh nodes; a remote executor can read every prompt it runs.
+
+### Data provenance
+
+The dashboard distinguishes these sources:
+
+| Source | Meaning |
+|---|---|
+| Node event | A timestamped record from `events.jsonl` |
+| Runtime endpoint | Current response from `/iicp/health` |
+| Runtime snapshot | Local `health-v1.json` state written by the node |
+| Registry API | Privacy-bounded directory inventory and aggregate state |
+| Directory counter observation | A counter increase seen by the monitor; not an original task event |
+| Log inference | A compatibility fallback, labelled as inferred |
+
+Unknown event names are neutral rather than healthy. Deployment-specific security
+facts are shown only when measured or configured; otherwise the dashboard reports
+them as unknown or unavailable.
+
+## Compatibility tests
+
+The test suite is dependency-free:
+
+```sh
+python3 -m unittest -v
+```
+
+It covers current and legacy registration failures, unknown events, Registry API
+inventory and fallback, health precedence, private/local configuration, task-delta
+provenance, secret non-access, and HTML injection resistance.
 
 ## License
 
