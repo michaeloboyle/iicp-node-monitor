@@ -14,20 +14,21 @@ Endpoints:
 
 Run:  python3 ~/.iicp/node-stats-server.py [--port 9486]
 """
-import argparse, calendar, glob, json, os, re, time, urllib.request
+import argparse, calendar, glob, html, json, os, re, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-IICP_DIR = os.path.expanduser("~/.iicp")
-LOGS = os.path.join(IICP_DIR, "logs")
+IICP_DIR = os.path.expanduser(os.environ.get("IICP_HOME", "~/.iicp"))
+LOGS = os.path.expanduser(os.environ.get("IICP_LOG_DIR", os.path.join(IICP_DIR, "logs")))
 EVENTS = os.path.join(LOGS, "events.jsonl")
 HISTORY = os.path.join(LOGS, "metrics-history.jsonl")  # longitudinal samples of slow dims
-OPERATOR = os.path.join(IICP_DIR, "operator.json")
-DIRECTORY = "https://iicp.network/api"
+DIRECTORY_EXPLICIT = bool(os.environ.get("IICP_DIRECTORY_URL"))
+DIRECTORY = os.environ.get("IICP_DIRECTORY_URL", "https://iicp.network/api").rstrip("/")
+MODE = os.environ.get("IICP_MODE", "public")
+HEALTH_URL = os.environ.get("IICP_NODE_HEALTH_URL")
 INTENT = "urn:iicp:intent:llm:chat:v1"
-# Curated intent probe list. There is no directory enumeration endpoint, so we
-# probe these and draw ONLY the ones with >=1 live provider (honest-dataviz: no
-# phantom functions). Add a (urn, short) pair here as the mesh grows new intents.
-INTENTS = [
+# Legacy fallback for directories that predate the Registry API. It is
+# intentionally labelled partial and is never presented as the IICP registry.
+LEGACY_INTENTS = [
     ("urn:iicp:intent:llm:chat:v1", "llm:chat"),
     ("urn:iicp:intent:llm:embedding:v1", "llm:embed"),
 ]
@@ -42,7 +43,7 @@ BEAT = {
     "call_ok": "task", "inference_ok": "task",
     "task_error": "bad", "task_refused": "warn", "policy_refused": "warn",
     "recovery_check": "warn", "heartbeat_error": "bad", "heartbeat_fail": "bad",
-    "register_error": "bad",
+    "register_fail": "bad", "register_error": "bad",  # latter is a legacy alias
 }
 
 # derived live state maintained by the background poller (tasks aren't in events.jsonl,
@@ -51,10 +52,47 @@ import threading
 _poll = {"last_tasks": None, "task_beats": [], "active_jobs": 0, "load": 0, "lock": threading.Lock()}
 
 
+def record_task_delta(previous, current, observed_at=None):
+    """Record one observation for a counter increase, never synthetic task events."""
+    if previous is None or current <= previous:
+        return None
+    event = {"t": observed_at or time.time(), "event": "directory_task_delta",
+             "cls": "observed", "source": "directory_counter_observation",
+             "detail": f"completed_tasks increased by {current - previous}"}
+    _poll["task_beats"].append(event)
+    _poll["task_beats"] = _poll["task_beats"][-100:]
+    return event
+
+
 def _get(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "iicp-node-stats/2"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+def configure(*, directory_url=None, log_dir=None, health_url=None, mode=None):
+    """Apply explicit monitor configuration (CLI has already resolved precedence)."""
+    global DIRECTORY, DIRECTORY_EXPLICIT, LOGS, EVENTS, HISTORY, HEALTH_URL, MODE
+    if directory_url is not None:
+        DIRECTORY = directory_url.rstrip("/")
+        DIRECTORY_EXPLICIT = True
+    if log_dir is not None:
+        LOGS = os.path.expanduser(log_dir)
+        EVENTS = os.path.join(LOGS, "events.jsonl")
+        HISTORY = os.path.join(LOGS, "metrics-history.jsonl")
+    if health_url is not None:
+        HEALTH_URL = health_url
+    if mode is not None:
+        MODE = mode
+
+
+def _short_intent(urn):
+    parts = str(urn).split(":")
+    return ":".join(parts[-3:-1]) if len(parts) >= 3 else str(urn)
+
+
+def _mode_allows_directory():
+    return MODE != "local_only"
 
 
 def _epoch(ts):
@@ -124,6 +162,42 @@ def current_node():
             "log_age_s": round(age, 1), "alive": age < 90}
 
 
+def runtime_health(local=None):
+    """Return health plus its evidence source, preferring explicit interfaces."""
+    local = local or current_node() or {}
+    if HEALTH_URL:
+        try:
+            health = _get(HEALTH_URL, timeout=3)
+            return {"available": True, "healthy": health.get("status") in ("ok", "degraded"),
+                    "source": "runtime_endpoint", "data": health}
+        except Exception as exc:  # noqa: BLE001
+            endpoint_error = str(exc)
+    else:
+        endpoint_error = None
+
+    node_name = os.environ.get("IICP_NODE_NAME") or local.get("node_id")
+    if node_name and re.match(r"^[A-Za-z0-9._-]+$", str(node_name)):
+        path = os.path.join(IICP_DIR, "run", str(node_name), "health-v1.json")
+        try:
+            with open(path) as fh:
+                health = json.load(fh)
+            return {"available": True,
+                    "healthy": health.get("liveness") == "live" and
+                               health.get("readiness") in ("ready", "degraded"),
+                    "source": "runtime_snapshot", "data": health,
+                    "endpoint_error": endpoint_error}
+        except (OSError, ValueError):
+            pass
+
+    if local:
+        return {"available": True, "healthy": bool(local.get("alive")),
+                "source": "log_freshness_inference",
+                "data": {"log_age_s": local.get("log_age_s")},
+                "endpoint_error": endpoint_error}
+    return {"available": False, "healthy": None, "source": "unavailable",
+            "endpoint_error": endpoint_error}
+
+
 def read_events(limit=240):
     out = []
     try:
@@ -135,7 +209,9 @@ def read_events(limit=240):
                     continue
                 ev = j.get("event", "")
                 out.append({"t": _epoch(j.get("ts", "")), "event": ev,
-                            "cls": BEAT.get(ev, "beat"), "detail": j.get("details", "")})
+                            "cls": BEAT.get(ev, "unknown"),
+                            "source": "node_event",
+                            "detail": j.get("details", "")})
     except OSError:
         pass
     out = [e for e in out if e["t"]]
@@ -146,7 +222,7 @@ def read_events(limit=240):
 
 
 def poll_tasks():
-    """Background: diff the directory's completed_tasks; emit a task beat per new task."""
+    """Observe directory counter changes without fabricating original task events."""
     while True:
         try:
             net = network_snapshot()
@@ -157,12 +233,7 @@ def poll_tasks():
                 with _poll["lock"]:
                     _poll["load"] = mine.get("load", 0)
                     last = _poll["last_tasks"]
-                    if last is not None and cur > last:
-                        for i in range(min(cur - last, 12)):
-                            _poll["task_beats"].append(
-                                {"t": now - i * 0.6, "event": "task_ok", "cls": "task",
-                                 "detail": f"task #{last + i + 1}"})
-                        _poll["task_beats"] = _poll["task_beats"][-100:]
+                    record_task_delta(last, cur, now)
                     _poll["last_tasks"] = cur
         except Exception:  # noqa: BLE001
             pass
@@ -173,21 +244,78 @@ def network_snapshot():
     """Whole-mesh topology + live per-node stats (directory-mediated star)."""
     local = current_node()
     ours = local and local.get("node_id")
-    out = {"now": time.time(), "directory": "iicp.network", "nodes": [], "mesh": {}}
+    out = {"now": time.time(), "directory": DIRECTORY or None, "nodes": [], "mesh": {},
+           "inventory_source": "unavailable", "inventory_complete": False}
+    if not _mode_allows_directory():
+        out["inventory_source"] = "disabled_local_only"
+        return out
+
+    # Current directories expose privacy-bounded Registry APIs. Inventory and
+    # routing are different operations; do not enumerate the mesh via discovery.
     try:
-        stats = _get(f"{DIRECTORY}/v1/stats")
-        mh = stats.get("mesh_health", {})
-        out["mesh"] = {"version": stats.get("server", {}).get("version"),
-                       "active_nodes": stats.get("server", {}).get("active_nodes"),
-                       "health": mh.get("label"), "health_score": mh.get("score"),
-                       "dist": mh.get("distribution", {})}
-    except Exception:  # noqa: BLE001
-        pass
-    # Probe each curated intent; union the providers, annotating which intents
-    # each node serves. Only intents with >=1 provider are emitted.
+        stats = _get(f"{DIRECTORY}/v1/registry/stats")
+        out["mesh"] = {
+            "version": stats.get("server_version") or stats.get("version"),
+            "active_nodes": stats.get("active_nodes") or stats.get("nodes", {}).get("active"),
+            "health": stats.get("health"),
+        }
+        intent_doc = _get(f"{DIRECTORY}/v1/registry/intents")
+        intent_rows = intent_doc.get("intents", [])
+        intents_out = [{
+            "urn": row.get("intent") or row.get("urn"),
+            "short": _short_intent(row.get("intent") or row.get("urn")),
+            "count": row.get("active_nodes", row.get("node_count", row.get("count", 0))),
+            "nodes": [],
+        } for row in intent_rows if row.get("intent") or row.get("urn")]
+
+        rows, page, limit, total = [], 1, 100, None
+        while total is None or len(rows) < total:
+            doc = _get(f"{DIRECTORY}/v1/registry/nodes?page={page}&limit={limit}")
+            batch = doc.get("nodes", [])
+            rows.extend(batch)
+            total = doc.get("total", len(rows))
+            if not batch or len(batch) < limit:
+                break
+            page += 1
+        for n in rows:
+            nid = str(n.get("node_id_prefix") or "")
+            intents = n.get("intents") or []
+            health = n.get("health_summary") or n.get("status_summary") or {}
+            if isinstance(health, dict):
+                health = health.get("label") or health.get("status") or "?"
+            perf = n.get("performance") or {}
+            tp = n.get("trust_progress") or {}
+            out["nodes"].append({
+                "id": nid, "ours": bool(ours and (ours == nid or ours.startswith(nid))),
+                "region": n.get("region", "?"), "health": health or "?",
+                "reputation": n.get("reputation_tier", "?"),
+                "score": n.get("reputation_score", n.get("score", 0)),
+                "tasks": tp.get("completed_tasks", n.get("completed_tasks", 0)),
+                "probation": n.get("probation"), "models": n.get("models") or [],
+                "backend": n.get("backend", "?"),
+                "reachable": n.get("directory_observed_reachable"),
+                "operator": n.get("operator_display_name"), "load": n.get("load", 0),
+                "active_jobs": n.get("active_jobs", 0),
+                "max_concurrent": n.get("max_concurrent"),
+                "sdk": n.get("sdk_version"),
+                "latency_ms": perf.get("task_latency_ms", n.get("observed_latency_ms")),
+                "jurisdiction": (n.get("node_policy_manifest") or {}).get("jurisdiction"),
+                "intents": [_short_intent(x) for x in intents],
+            })
+            for intent in intents_out:
+                if intent["urn"] in intents:
+                    intent["nodes"].append(nid)
+        out["intents"] = intents_out
+        out["inventory_source"] = "registry_api"
+        out["inventory_complete"] = len(rows) >= (total or 0)
+        return out
+    except Exception as registry_error:  # noqa: BLE001
+        out["registry_error"] = str(registry_error)
+
+    # Backward-compatible, explicitly partial fallback for older directories.
     node_map = {}   # node_id -> node dict (deduped across intents)
     intents_out = []
-    for urn, short in INTENTS:
+    for urn, short in LEGACY_INTENTS:
         try:
             disc = _get(f"{DIRECTORY}/v1/discover?intent={urn}")
         except Exception as e:  # noqa: BLE001
@@ -220,6 +348,8 @@ def network_snapshot():
             intents_out.append({"urn": urn, "short": short, "count": len(ids), "nodes": ids})
     out["nodes"] = list(node_map.values())
     out["intents"] = intents_out
+    out["inventory_source"] = "legacy_discovery_partial"
+    out["inventory_complete"] = False
     return out
 
 
@@ -308,44 +438,31 @@ TIER_COL = {"probation": "--bad", "silver": "--mut", "gold": "--warn", "platinum
 HEALTH_COL = {"healthy": "--ok", "degraded": "--warn", "critical": "--bad", "offline": "--bad"}
 
 
-def operator_secret_encrypted():
-    try:
-        d = json.load(open(OPERATOR))
-        sec = d.get("operator_secret", "")
-        # heuristic: encrypted secrets are wrapped/prefixed; plaintext is raw base64
-        return bool(d.get("secret_encrypted")) or sec.startswith("enc:")
-    except OSError:
-        return None
+def operator_secret_status():
+    """Report non-secret configuration metadata; never open the secret file."""
+    provider = os.environ.get("IICP_OPERATOR_SECRET_PROVIDER")
+    reference = os.environ.get("IICP_OPERATOR_SECRET_REF")
+    if provider or reference:
+        return {"state": "referenced", "source": "configured_metadata",
+                "provider": provider or "unspecified"}
+    return {"state": "unavailable", "source": "not_advertised"}
 
 
 def snapshot():
     local = current_node()
     out = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "local": local,
-           "directory": None, "mesh": None, "security": None, "error": None}
-    mine = None
-    try:
-        stats = _get(f"{DIRECTORY}/v1/stats")
-        out["mesh"] = {"version": stats.get("server", {}).get("version"),
-                       "active_nodes": stats.get("server", {}).get("active_nodes"),
-                       "mesh_health": stats.get("mesh_health", {}),
-                       "directory_health": stats.get("directory_health", {}).get("label")}
-    except Exception as e:  # noqa: BLE001
-        out["error"] = f"mesh: {e}"
-    try:
-        disc = _get(f"{DIRECTORY}/v1/discover?intent={INTENT}")
-        nid = local and local.get("node_id")
-        mine = next((n for n in disc.get("nodes", []) if n.get("node_id") == nid), None)
-        if mine:
-            out["directory"] = {k: mine.get(k) for k in (
-                "score", "available", "directory_observed_reachable", "route_evidence",
-                "reachability_tier", "exposure_mode", "health_label", "probation",
-                "reputation_tier", "region", "backend", "endpoint", "models",
-                "trust_progress", "load", "active_jobs", "max_concurrent",
-                "operator_display_name", "operator_fingerprint")}
-        else:
-            out["directory"] = {"listed": False}
-    except Exception as e:  # noqa: BLE001
-        out["error"] = (out["error"] or "") + f" discover: {e}"
+           "directory": None, "mesh": None, "runtime_health": None,
+           "security": None, "error": None}
+    net = network_snapshot()
+    out["mesh"] = net.get("mesh")
+    out["inventory"] = {"source": net.get("inventory_source"),
+                        "complete": net.get("inventory_complete")}
+    mine = next((n for n in net.get("nodes", []) if n.get("ours")), None)
+    out["directory"] = mine or ({"listed": False} if _mode_allows_directory() else
+                                 {"listed": None, "source": "disabled_local_only"})
+    if net.get("error") or net.get("registry_error"):
+        out["error"] = net.get("error") or net.get("registry_error")
+    out["runtime_health"] = runtime_health(local)
 
     # ---- security posture (derived, honest) ----
     evs = read_events()
@@ -361,16 +478,19 @@ def snapshot():
     if isinstance(d, dict) and d.get("active_jobs", 0) and d.get("max_concurrent"):
         if d["active_jobs"] >= d["max_concurrent"]:
             anomalies.append("all concurrency slots busy (possible load/abuse)")
+    endpoint = (d.get("endpoint") if isinstance(d, dict) else None) or (local or {}).get("endpoint")
+    intents = mine.get("intents", []) if mine else []
     out["security"] = {
-        "inbound_surface": "1 path: Cloudflare tunnel -> POST /v1/task (inference only)",
-        "code_execution": "REFUSED (bash / write_file not served; intent = llm:chat only)",
-        "served_intent": INTENT,
-        "home_ip": "masked by Cloudflare tunnel (origin hidden)",
-        "data_exposure": "none of your data - public open-weights model, no filesystem access",
+        "inbound_surface": {"value": urllib.parse.urlsplit(endpoint).scheme if endpoint else None,
+                            "source": "configured_endpoint" if endpoint else "unavailable"},
+        "code_execution": {"value": None, "source": "not_advertised"},
+        "served_intents": {"value": intents, "source": "directory_reported" if mine else "unavailable"},
+        "home_ip": {"value": None, "source": "not_measured"},
+        "data_exposure": {"value": None, "source": "not_advertised"},
         "max_concurrent": d.get("max_concurrent"),
         "active_jobs": d.get("active_jobs"),
-        "operator": d.get("operator_display_name"),
-        "operator_secret_encrypted_at_rest": operator_secret_encrypted(),
+        "operator": d.get("operator") or d.get("operator_display_name"),
+        "operator_secret": operator_secret_status(),
         "last_beat_age_s": last_beat_age,
         "tasks_seen": len(task_evs),
         "warnings_seen": len(warn_evs),
@@ -382,42 +502,46 @@ def snapshot():
 # ------------------------------------------------------------------ rendering
 def badge(state, label):
     cls = {True: "ok", False: "bad", None: "warn"}.get(state, state)
-    return f'<span class="badge {cls}">{label}</span>'
+    cls = cls if cls in ("ok", "bad", "warn") else "warn"
+    return f'<span class="badge {cls}">{html.escape(str(label))}</span>'
 
 
 def render(s, screensaver=False):
     loc, d = s.get("local") or {}, s.get("directory") or {}
     sec, mesh = s.get("security") or {}, s.get("mesh") or {}
     tp = d.get("trust_progress") or {} if isinstance(d, dict) else {}
+    if isinstance(d, dict) and "tasks" in d:
+        tp = {"completed_tasks": d.get("tasks"), "gold_min_tasks": "-"}
     alive = loc.get("alive")
     status = "SERVING" if alive else "DOWN"
 
-    def row(k, v):
-        return f"<tr><td class='k'>{k}</td><td class='v'>{v}</td></tr>"
+    def row(k, v, safe=False):
+        value = str(v) if safe else html.escape(str(v if v is not None else "unavailable"))
+        return f"<tr><td class='k'>{html.escape(str(k))}</td><td class='v'>{value}</td></tr>"
 
     node_rows = (
-        row("operator", f"<b>{sec.get('operator') or '(anonymous)'}</b>")
-        + row("node_id", f"<code>{loc.get('node_id','-')}</code>")
+        row("operator", f"<b>{html.escape(str(sec.get('operator') or '(anonymous)'))}</b>", safe=True)
+        + row("node_id", f"<code>{html.escape(str(loc.get('node_id','-')))}</code>", safe=True)
         + row("model", loc.get("model") or d.get("models", ["-"])[0])
-        + row("endpoint", f"<code>{d.get('endpoint') or loc.get('endpoint') or '-'}</code>")
-        + row("reachable (dir-observed)", badge(d.get("directory_observed_reachable") is True, str(d.get("directory_observed_reachable"))))
-        + row("reputation", d.get("reputation_tier", "-"))
-        + row("probation", badge(d.get("probation") is False, str(d.get("probation"))))
+        + row("endpoint", f"<code>{html.escape(str(d.get('endpoint') or loc.get('endpoint') or '-'))}</code>", safe=True)
+        + row("reachable (dir-observed)", badge(d.get("reachable") is True, str(d.get("reachable"))), safe=True)
+        + row("reputation", d.get("reputation", d.get("reputation_tier", "-")))
+        + row("probation", badge(d.get("probation") is False, str(d.get("probation"))), safe=True)
         + row("completed tasks", f"{tp.get('completed_tasks','-')} (gold at {tp.get('gold_min_tasks','-')})")
         + row("heartbeats", f"{loc.get('heartbeats','-')} (last {sec.get('last_beat_age_s','-')}s ago)")
     )
     sec_rows = (
-        row("inbound surface", sec.get("inbound_surface"))
-        + row("code execution", badge(True, "REFUSED") + " " + "bash / write_file")
-        + row("home IP", sec.get("home_ip"))
-        + row("data exposure", sec.get("data_exposure"))
+        row("inbound surface", f"{sec.get('inbound_surface',{}).get('value') or 'unknown'} [{sec.get('inbound_surface',{}).get('source','unavailable')}]")
+        + row("code execution", "unknown [not advertised]")
+        + row("home IP", "unknown [not measured]")
+        + row("data exposure", "unknown [not advertised]")
         + row("concurrency cap", f"{sec.get('active_jobs','-')} / {sec.get('max_concurrent','-')} slots busy")
-        + row("operator secret at rest", badge(sec.get("operator_secret_encrypted_at_rest"),
-              "encrypted" if sec.get("operator_secret_encrypted_at_rest") else "PLAINTEXT - run `operator encrypt`"))
+        + row("operator secret at rest", f"{sec.get('operator_secret',{}).get('state','unavailable')} "
+              f"[{sec.get('operator_secret',{}).get('source','unavailable')}]")
         + row("tasks / warnings seen", f"{sec.get('tasks_seen',0)} / {sec.get('warnings_seen',0)}")
     )
     anom = sec.get("anomalies") or []
-    anom_html = ("".join(f"<li>{a}</li>" for a in anom) if anom
+    anom_html = ("".join(f"<li>{html.escape(str(a))}</li>" for a in anom) if anom
                  else "<li class='clear'>no anomalies - rhythm nominal</li>")
     mesh_rows = (row("directory", mesh.get("version", "-"))
                  + row("active nodes", mesh.get("active_nodes", "-"))
@@ -448,7 +572,7 @@ def render(s, screensaver=False):
             + "</table>"
             + f"<div class='sub'>{len(hist)} samples over ~{span_min} min · 1/min · newest at right · every mark is one measurement</div>")
 
-    err = f"<div class='err'>{s['error']}</div>" if s.get("error") else ""
+    err = f"<div class='err'>{html.escape(str(s['error']))}</div>" if s.get("error") else ""
     htmlcls = "ss" if screensaver else ""
     return f"""<!doctype html><html class="{htmlcls}"{' data-theme="dark"' if screensaver else ''}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -520,7 +644,7 @@ html.ss,html.ss *{{cursor:none}}
 </style></head><body><div class="wrap">
 <h1>IICP node <span class="pill {'up' if alive else 'down'}">{status}</span>
   <span class="bpm" id="bpm">--</span></h1>
-<div class="sub">{s['ts']} - operator <b>{sec.get('operator') or '(anonymous)'}</b>
+<div class="sub">{html.escape(str(s['ts']))} - operator <b>{html.escape(str(sec.get('operator') or '(anonymous)'))}</b>
   - <a href="/api.json">json</a> / <a href="/events.json">events</a> / <a href="?mode=screensaver">screensaver</a></div>
 {err}
 <div class="card" id="ecgcard"><h2>Cardiogram <span id="beatage">-</span></h2>
@@ -528,13 +652,15 @@ html.ss,html.ss *{{cursor:none}}
   <div class="leg">
     <span><span class="dot" style="background:var(--ecg)"></span><b>beat</b> directory heartbeat (~30s)</span>
     <span><span class="dot" style="background:#3b82f6"></span><b>task</b> inference served</span>
+    <span><span class="dot" style="background:#7c3aed"></span><b>observed</b> directory counter change</span>
     <span><span class="dot" style="background:var(--warn)"></span><b>warn</b> refusal/recovery</span>
+    <span><span class="dot" style="background:var(--mut)"></span><b>unknown</b> unclassified event</span>
     <span><span class="dot" style="background:var(--bad)"></span><b>flatline</b> node down</span>
   </div></div>
 <div class="card" id="netcard"><h2>Mesh network <span id="netcount">-</span></h2>
   <div class="ecgwrap" style="background:var(--card)"><canvas id="net" width="1600" height="520"></canvas></div>
   <div class="leg">
-    <span><span class="dot" style="background:var(--accent)"></span><b>this node</b> ({sec.get('operator') or 'anon'})</span>
+    <span><span class="dot" style="background:var(--accent)"></span><b>this node</b> ({html.escape(str(sec.get('operator') or 'anon'))})</span>
     <span><span class="dot" style="background:var(--ok)"></span>healthy</span>
     <span><span class="dot" style="background:var(--warn)"></span>degraded</span>
     <span><span class="dot" style="background:var(--bad)"></span>critical/offline</span>
@@ -554,6 +680,7 @@ html.ss,html.ss *{{cursor:none}}
 </div>
 <script>
 const col=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const h=v=>String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 // DPR-aware backing store so text/strokes stay crisp (not bitmap-scaled)
 function fit(cv){{ const r=cv.getBoundingClientRect(),d=window.devicePixelRatio||1;
   cv.width=Math.round(r.width*d); cv.height=Math.round(r.height*d);
@@ -579,7 +706,8 @@ function draw(){{
   events.forEach(e=>{{
     const px=W-((now-e.t)/span)*W; if(px<0||px>W) return;
     const h = e.cls==='task'? H*0.44 : e.cls==='bad'? H*0.34 : e.cls==='warn'? H*0.22 : H*0.18;
-    const color = e.cls==='task'?'#3b82f6': e.cls==='warn'?col('--warn'): e.cls==='bad'?col('--bad'):col('--ecg');
+    const color = e.cls==='task'?'#3b82f6': e.cls==='observed'?'#7c3aed':
+      e.cls==='unknown'?col('--mut'): e.cls==='warn'?col('--warn'): e.cls==='bad'?col('--bad'):col('--ecg');
     ctx.strokeStyle=color;ctx.lineWidth=e.cls==='task'?2.6:1.8;
     ctx.beginPath();ctx.moveTo(px-3,BASE);ctx.lineTo(px,BASE-h);ctx.lineTo(px+3,BASE); // clean tick
     if(e.cls==='bad') ctx.lineTo(px,BASE+h*0.35);                                       // failures dip below
@@ -674,14 +802,15 @@ async function netPoll(){{
     if(tb) tb.innerHTML = nodes.map(n=>{{
       const models=n.models||[]; const mstr=models.length? models[0]+(models.length>1?' +'+(models.length-1):'') : '-';
       const lat=n.latency_ms? Math.round(n.latency_ms)+'ms':'-';
+      const hc=['healthy','degraded','critical','offline'].includes(n.health)?n.health:'unknown';
       return `<tr class="${{n.ours?'ours':''}}">`
-        +`<td>${{n.ours?'★ ':''}}${{n.id}}${{n.operator?' <span class=op>'+n.operator+'</span>':''}}</td>`
-        +`<td>${{n.region}}</td><td class="h-${{n.health}}">${{n.health}}${{n.probation?' ⚠':''}}</td>`
-        +`<td>${{n.reputation}}</td><td>${{n.tasks}}</td>`
-        +`<td title="${{models.join(', ')}}">${{mstr}}</td>`
-        +`<td>${{n.backend}}</td><td>${{n.active_jobs}}/${{n.max_concurrent||'-'}}</td>`
-        +`<td>${{lat}}</td><td>${{n.reachable===true?'yes':n.reachable===false?'no':'-'}}</td>`
-        +`<td>${{n.jurisdiction||'-'}}</td><td>${{(n.intents||[]).join(', ')||'-'}}</td></tr>`;
+        +`<td>${{n.ours?'★ ':''}}${{h(n.id)}}${{n.operator?' <span class=op>'+h(n.operator)+'</span>':''}}</td>`
+        +`<td>${{h(n.region)}}</td><td class="h-${{hc}}">${{h(n.health)}}${{n.probation?' ⚠':''}}</td>`
+        +`<td>${{h(n.reputation)}}</td><td>${{h(n.tasks)}}</td>`
+        +`<td title="${{h(models.join(', '))}}">${{h(mstr)}}</td>`
+        +`<td>${{h(n.backend)}}</td><td>${{h(n.active_jobs)}}/${{h(n.max_concurrent||'-')}}</td>`
+        +`<td>${{h(lat)}}</td><td>${{n.reachable===true?'yes':n.reachable===false?'no':'-'}}</td>`
+        +`<td>${{h(n.jurisdiction||'-')}}</td><td>${{h((n.intents||[]).join(', ')||'-')}}</td></tr>`;
     }}).join('') || '<tr><td colspan="12">no nodes</td></tr>';
   }}catch(e){{}}
 }}
@@ -732,7 +861,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=9486)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--directory-url", default=os.environ.get("IICP_DIRECTORY_URL"))
+    ap.add_argument("--log-dir", default=os.environ.get("IICP_LOG_DIR"))
+    ap.add_argument("--node-health-url", default=os.environ.get("IICP_NODE_HEALTH_URL"))
+    ap.add_argument("--mode", choices=("public", "private", "federated_private",
+                                       "local_only", "custom"),
+                    default=os.environ.get("IICP_MODE", "public"))
     a = ap.parse_args()
+    configure(directory_url=a.directory_url, log_dir=a.log_dir,
+              health_url=a.node_health_url, mode=a.mode)
+    if a.mode in ("private", "federated_private") and not DIRECTORY_EXPLICIT:
+        ap.error(f"--mode {a.mode} requires --directory-url or IICP_DIRECTORY_URL; "
+                 "the monitor will not fall back to public Genesis")
+    if a.host not in ("127.0.0.1", "::1", "localhost"):
+        print("[iicp-stats] WARNING: non-loopback bind exposes operational metadata")
     threading.Thread(target=poll_tasks, daemon=True).start()
     threading.Thread(target=sample_loop, daemon=True).start()
     print(f"[iicp-stats] http://{a.host}:{a.port}/")
