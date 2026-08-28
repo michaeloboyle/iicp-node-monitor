@@ -19,6 +19,8 @@ class MonitorCompatibilityTests(unittest.TestCase):
         self.old = (monitor.LOGS, monitor.EVENTS, monitor.HISTORY, monitor.DIRECTORY,
                     monitor.DIRECTORY_EXPLICIT, monitor.MODE, monitor.HEALTH_URL)
         monitor._poll["task_beats"] = []
+        monitor._public_probe.update({"endpoint": None, "node_id": None,
+                                      "checked": 0.0, "result": None})
 
     def tearDown(self):
         (monitor.LOGS, monitor.EVENTS, monitor.HISTORY, monitor.DIRECTORY,
@@ -104,6 +106,67 @@ class MonitorCompatibilityTests(unittest.TestCase):
              mock.patch.dict(os.environ, {"IICP_NODE_NAME": "missing-test-node"}):
             result = monitor.runtime_health({"alive": True, "log_age_s": 2})
         self.assertEqual(result["source"], "log_freshness_inference")
+
+    def test_public_probe_refuses_non_https_and_non_public_targets(self):
+        with mock.patch.object(monitor.socket, "getaddrinfo") as resolve:
+            result = monitor.probe_public_endpoint("http://127.0.0.1:9484/private")
+        resolve.assert_not_called()
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["reason"], "unsafe_or_unsupported_endpoint")
+
+        with mock.patch.object(monitor.socket, "getaddrinfo", return_value=[
+                (monitor.socket.AF_INET, monitor.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]):
+            result = monitor.probe_public_endpoint("https://node.example")
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["reason"], "unsafe_address")
+
+    def test_public_probe_pins_validated_address_and_checks_health_identity(self):
+        response = mock.Mock(status=200)
+        response.read.return_value = json.dumps(
+            {"status": "ok", "node_id": "node-1"}).encode()
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with mock.patch.object(monitor.socket, "getaddrinfo", return_value=[
+                (monitor.socket.AF_INET, monitor.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]), \
+             mock.patch.object(monitor.http.client, "HTTPSConnection", return_value=connection), \
+             mock.patch.object(monitor.socket, "create_connection", return_value=mock.Mock()) as connect:
+            result = monitor.probe_public_endpoint("https://node.example/anything", "node-1")
+            connection._create_connection(("ignored", 443), 2)
+        self.assertEqual(result["state"], "reachable")
+        self.assertEqual(result["reason"], "health_verified")
+        connection.request.assert_called_once()
+        self.assertEqual(connection.request.call_args.args[:2], ("GET", "/iicp/health"))
+        self.assertEqual(connect.call_args.args[0], ("93.184.216.34", 443))
+
+    def test_public_probe_does_not_follow_redirects_or_expose_exception_text(self):
+        response = mock.Mock(status=302)
+        response.read.return_value = b""
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with mock.patch.object(monitor.socket, "getaddrinfo", return_value=[
+                (monitor.socket.AF_INET, monitor.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]), \
+             mock.patch.object(monitor.http.client, "HTTPSConnection", return_value=connection):
+            result = monitor.probe_public_endpoint("https://node.example", "node-1")
+        self.assertEqual(result["state"], "unreachable")
+        self.assertEqual(result["reason"], "http_status")
+        self.assertEqual(result["http_status"], 302)
+        self.assertNotIn("exception", json.dumps(result).lower())
+
+    def test_snapshot_keeps_monitor_and_directory_reachability_independent(self):
+        local = {"node_id": "node-1", "endpoint": "https://node.example", "alive": True}
+        network = {"mesh": {}, "nodes": [{"ours": True, "reachable": True}],
+                   "inventory_source": "registry_api", "inventory_complete": True}
+        measured = {"state": "unreachable", "source": "monitor_measured",
+                    "reason": "connect_or_tls_failure", "latency_ms": 4}
+        with mock.patch.object(monitor, "current_node", return_value=local), \
+             mock.patch.object(monitor, "network_snapshot", return_value=network), \
+             mock.patch.object(monitor, "runtime_health", return_value={"healthy": True}), \
+             mock.patch.object(monitor, "public_endpoint_reachability", return_value=measured):
+            result = monitor.snapshot()
+        self.assertEqual(result["directory"]["reachable"], True)
+        self.assertEqual(result["public_endpoint_reachability"]["state"], "unreachable")
+        self.assertIn("directory and monitor reachability evidence disagree",
+                      result["security"]["anomalies"])
 
     def test_task_delta_is_one_observation_not_fabricated_events(self):
         event = monitor.record_task_delta(10, 14, 1234)

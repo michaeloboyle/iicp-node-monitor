@@ -93,6 +93,13 @@ Private and federated-private modes require an explicit directory. Local-only
 mode performs no directory requests. The monitor never silently falls back to
 the public Genesis directory for those modes.
 
+When the node's advertised endpoint is available, `/api.json` also includes an
+independent `public_endpoint_reachability` measurement. The monitor requests the
+advertised origin's `/iicp/health` route with a short timeout, no redirects and a
+bounded response. It refuses credentials, non-HTTPS targets, non-default ports
+and non-public IP addresses. This evidence remains separate from both local
+runtime health and `directory_observed_reachable`.
+
 ### Endpoints
 
 | Path | What |
@@ -117,10 +124,14 @@ sed "s#__HOME__#$HOME#g" launchd/local.iicp-stats.plist.example \
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.iicp-stats.plist
 ```
 
-The node plist example (`network.iicp.node.default.plist.example`) is the one
-`iicp-node service install` writes, plus two fixups it omits: a `PATH` that
-includes `cloudflared` and `iicp-node`, and `IICP_TUNNEL=1`. Without those the
-node advertises an unreachable endpoint.
+Use the official `iicp-node service install` command for the node itself. It
+already writes an absolute path for `iicp-node`; the service does not need shell
+`PATH` to find that executable. Older clients may still need an explicit
+`IICP_CLOUDFLARED_PATH` so launchd can find Quick Tunnel fallback. Leaving
+`IICP_TUNNEL` unset preserves automatic reachability selection; setting it to
+`1` forces a tunnel and is not a general launchd fix. The node plist in this
+repository is therefore a version-scoped compatibility example, not a
+replacement for the official installer.
 
 ## Examples
 
@@ -156,6 +167,7 @@ The dashboard distinguishes these sources:
 | Runtime snapshot | Local `health-v1.json` state written by the node |
 | Registry API | Privacy-bounded directory inventory and aggregate state |
 | Directory counter observation | A counter increase seen by the monitor; not an original task event |
+| Monitor public-route probe | A bounded, redirect-free HTTPS check of this node's advertised `/iicp/health`; independent of directory evidence |
 | Log inference | A compatibility fallback, labelled as inferred |
 
 Unknown event names are neutral rather than healthy. Deployment-specific security

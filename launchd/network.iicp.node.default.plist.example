@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- The plist `iicp-node service install` writes, plus two fixups it omits:
-     a PATH that includes cloudflared + iicp-node, and IICP_TUNNEL=1. Without
-     those the node advertises an unreachable endpoint. Replace __HOME__ with
-     your home dir. -->
+<!-- Version-scoped compatibility example for older IICP clients. Prefer
+     `iicp-node service install`. The official installer already writes an
+     absolute iicp-node path. Set the exact cloudflared path only when an older
+     installer cannot preserve it. Leaving IICP_TUNNEL unset keeps automatic
+     route selection; add IICP_TUNNEL=1 only when a tunnel is intentionally
+     forced. Replace __HOME__ and the cloudflared path for the local machine. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>network.iicp.node.default</string>
@@ -11,11 +13,9 @@
   <dict>
     <key>IICP_NODE_NAME</key><string>default</string>
     <key>IICP_SUPERVISED</key><string>1</string>
-    <key>IICP_TUNNEL</key><string>1</string>
+    <key>IICP_CLOUDFLARED_PATH</key><string>/opt/homebrew/bin/cloudflared</string>
     <key>IICP_TUNNEL_DEAD_POLICY</key><string>auto</string>
     <key>IICP_LOG_DIR</key><string>__HOME__/.iicp/logs</string>
-    <!-- PATH must include cloudflared (~/.local/bin) and iicp-node (~/.cargo/bin) -->
-    <key>PATH</key><string>__HOME__/.local/bin:__HOME__/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>ProgramArguments</key>
   <array>

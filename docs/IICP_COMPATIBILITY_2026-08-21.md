@@ -30,6 +30,20 @@ official IICP component or conformance implementation.
 | Secret encryption can be checked by opening `operator.json` | Secret files are not an observability API | Security issue | Never open the file; consume non-secret reference metadata or report unavailable. |
 | Directory/provider strings are safe HTML | Public metadata is externally controlled | Security issue | Escape server-rendered values and client-rendered table fields. |
 
+## 28 August 2026 route-readiness addendum
+
+The official Rust service generator already resolves `iicp-node` to an absolute
+path, and an unset `IICP_TUNNEL` keeps automatic route selection enabled. The
+remaining supervisor mismatch is older clients' PATH-only `cloudflared`
+discovery. The compatibility plist now documents an explicit absolute
+`IICP_CLOUDFLARED_PATH` rather than replacing the whole service environment or
+forcing every node through a tunnel.
+
+Directory-reported reachability, local process health and externally usable
+route health are separate observations. The monitor now measures the advertised
+HTTPS `/iicp/health` route independently and reports disagreements without
+changing node or directory state.
+
 ## Interface authority
 
 - `/iicp/health` is an IICP node surface with a normative minimal health check;
@@ -52,6 +66,8 @@ tracked separately by the IICP project rather than being decided by this monitor
 - Unknown events cannot appear as healthy heartbeats.
 - Derived counter observations are distinguishable from node events.
 - External metadata is escaped before HTML rendering.
+- Public-route checks reject private addresses, redirects, credentials and
+  oversized responses, and do not expose raw network exceptions.
 - Loopback remains the default; non-loopback operation emits an exposure warning.
 
 ## Validation
