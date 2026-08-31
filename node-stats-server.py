@@ -14,7 +14,20 @@ Endpoints:
 
 Run:  python3 ~/.iicp/node-stats-server.py [--port 9486]
 """
-import argparse, calendar, glob, html, json, os, re, time, urllib.parse, urllib.request
+import argparse
+import calendar
+import glob
+import html
+import http.client
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import time
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IICP_DIR = os.path.expanduser(os.environ.get("IICP_HOME", "~/.iicp"))
@@ -50,6 +63,8 @@ BEAT = {
 # so we reconstruct them from the directory's completed_tasks counter)
 import threading
 _poll = {"last_tasks": None, "task_beats": [], "active_jobs": 0, "load": 0, "lock": threading.Lock()}
+_public_probe = {"endpoint": None, "node_id": None, "checked": 0.0,
+                 "result": None, "lock": threading.Lock()}
 
 
 def record_task_delta(previous, current, observed_at=None):
@@ -68,6 +83,110 @@ def _get(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "iicp-node-stats/2"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+def _probe_result(state, reason, checked_at, started, **extra):
+    result = {
+        "state": state,
+        "source": "monitor_measured",
+        "reason": reason,
+        "checked_at": checked_at,
+        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+    }
+    result.update(extra)
+    return result
+
+
+def probe_public_endpoint(endpoint, node_id=None, timeout=3):
+    """Measure the advertised HTTPS health route without following redirects.
+
+    The probe resolves the hostname first, refuses credentials and non-public
+    addresses, pins the connection to one validated address, reads a bounded
+    response, and reports only reason classes rather than exception text.
+    """
+    started = time.monotonic()
+    checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not endpoint:
+        return _probe_result("unknown", "endpoint_unavailable", checked_at, started)
+    try:
+        parsed = urllib.parse.urlsplit(str(endpoint))
+        host = parsed.hostname
+        port = parsed.port or 443
+    except (TypeError, ValueError):
+        return _probe_result("unknown", "invalid_endpoint", checked_at, started)
+    if (parsed.scheme.lower() != "https" or not host or parsed.username or
+            parsed.password or parsed.fragment or port != 443):
+        return _probe_result("unknown", "unsafe_or_unsupported_endpoint", checked_at, started)
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+        rows = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addresses = sorted({row[4][0] for row in rows})
+        parsed_addresses = [ipaddress.ip_address(value) for value in addresses]
+    except (OSError, UnicodeError, ValueError):
+        return _probe_result("unknown", "dns_unavailable", checked_at, started,
+                             endpoint_host=host)
+    if not addresses or not all(address.is_global for address in parsed_addresses):
+        return _probe_result("unknown", "unsafe_address", checked_at, started,
+                             endpoint_host=host)
+
+    for address in addresses:
+        connection = http.client.HTTPSConnection(
+            host, port, timeout=timeout, context=ssl.create_default_context())
+
+        def connect_validated(_target, connect_timeout=timeout, source_address=None):
+            return socket.create_connection(
+                (address, port), timeout=connect_timeout, source_address=source_address)
+
+        connection._create_connection = connect_validated
+        try:
+            connection.request(
+                "GET", "/iicp/health",
+                headers={"Accept": "application/json", "Connection": "close",
+                         "User-Agent": "iicp-node-stats/2 route-readiness-probe"})
+            response = connection.getresponse()
+            body = response.read(16_385)
+            if not 200 <= response.status < 300:
+                return _probe_result("unreachable", "http_status", checked_at, started,
+                                     endpoint_host=host, http_status=response.status)
+            if len(body) > 16_384:
+                return _probe_result("unreachable", "oversized_health_response", checked_at,
+                                     started, endpoint_host=host)
+            try:
+                health = json.loads(body.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                return _probe_result("unreachable", "invalid_health_response", checked_at,
+                                     started, endpoint_host=host)
+            if not isinstance(health, dict) or health.get("status") not in ("ok", "degraded"):
+                return _probe_result("unreachable", "unhealthy_response", checked_at, started,
+                                     endpoint_host=host)
+            observed_node_id = health.get("node_id")
+            if node_id and observed_node_id and str(observed_node_id) != str(node_id):
+                return _probe_result("unreachable", "node_identity_mismatch", checked_at,
+                                     started, endpoint_host=host)
+            return _probe_result("reachable", "health_verified", checked_at, started,
+                                 endpoint_host=host,
+                                 node_identity_checked=bool(node_id and observed_node_id))
+        except (OSError, ssl.SSLError, http.client.HTTPException):
+            pass
+        finally:
+            connection.close()
+    return _probe_result("unreachable", "connect_or_tls_failure", checked_at, started,
+                         endpoint_host=host)
+
+
+def public_endpoint_reachability(endpoint, node_id=None, cache_seconds=30):
+    """Return a short-lived cached public-route measurement for this node."""
+    now = time.monotonic()
+    with _public_probe["lock"]:
+        if (_public_probe["result"] is not None and
+                _public_probe["endpoint"] == endpoint and
+                _public_probe["node_id"] == node_id and
+                now - _public_probe["checked"] < cache_seconds):
+            return dict(_public_probe["result"])
+        result = probe_public_endpoint(endpoint, node_id=node_id)
+        _public_probe.update({"endpoint": endpoint, "node_id": node_id,
+                              "checked": time.monotonic(), "result": result})
+        return dict(result)
 
 
 def configure(*, directory_url=None, log_dir=None, health_url=None, mode=None):
@@ -452,6 +571,7 @@ def snapshot():
     local = current_node()
     out = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "local": local,
            "directory": None, "mesh": None, "runtime_health": None,
+           "public_endpoint_reachability": None,
            "security": None, "error": None}
     net = network_snapshot()
     out["mesh"] = net.get("mesh")
@@ -479,6 +599,12 @@ def snapshot():
         if d["active_jobs"] >= d["max_concurrent"]:
             anomalies.append("all concurrency slots busy (possible load/abuse)")
     endpoint = (d.get("endpoint") if isinstance(d, dict) else None) or (local or {}).get("endpoint")
+    public_probe = public_endpoint_reachability(endpoint, (local or {}).get("node_id"))
+    out["public_endpoint_reachability"] = public_probe
+    if public_probe.get("state") == "unreachable":
+        anomalies.append("advertised public endpoint failed the monitor's independent health probe")
+    if isinstance(d, dict) and d.get("reachable") is True and public_probe.get("state") == "unreachable":
+        anomalies.append("directory and monitor reachability evidence disagree")
     intents = mine.get("intents", []) if mine else []
     out["security"] = {
         "inbound_surface": {"value": urllib.parse.urlsplit(endpoint).scheme if endpoint else None,
@@ -509,6 +635,7 @@ def badge(state, label):
 def render(s, screensaver=False):
     loc, d = s.get("local") or {}, s.get("directory") or {}
     sec, mesh = s.get("security") or {}, s.get("mesh") or {}
+    public_probe = s.get("public_endpoint_reachability") or {}
     tp = d.get("trust_progress") or {} if isinstance(d, dict) else {}
     if isinstance(d, dict) and "tasks" in d:
         tp = {"completed_tasks": d.get("tasks"), "gold_min_tasks": "-"}
@@ -525,6 +652,8 @@ def render(s, screensaver=False):
         + row("model", loc.get("model") or d.get("models", ["-"])[0])
         + row("endpoint", f"<code>{html.escape(str(d.get('endpoint') or loc.get('endpoint') or '-'))}</code>", safe=True)
         + row("reachable (dir-observed)", badge(d.get("reachable") is True, str(d.get("reachable"))), safe=True)
+        + row("reachable (monitor)", badge(public_probe.get("state") == "reachable",
+              f"{public_probe.get('state', 'unknown')} [{public_probe.get('source', 'unavailable')}]"), safe=True)
         + row("reputation", d.get("reputation", d.get("reputation_tier", "-")))
         + row("probation", badge(d.get("probation") is False, str(d.get("probation"))), safe=True)
         + row("completed tasks", f"{tp.get('completed_tasks','-')} (gold at {tp.get('gold_min_tasks','-')})")
@@ -534,6 +663,8 @@ def render(s, screensaver=False):
         row("inbound surface", f"{sec.get('inbound_surface',{}).get('value') or 'unknown'} [{sec.get('inbound_surface',{}).get('source','unavailable')}]")
         + row("code execution", "unknown [not advertised]")
         + row("home IP", "unknown [not measured]")
+        + row("public route", f"{public_probe.get('state', 'unknown')} "
+              f"[{public_probe.get('reason', 'not measured')}; {public_probe.get('latency_ms', '-')}ms]")
         + row("data exposure", "unknown [not advertised]")
         + row("concurrency cap", f"{sec.get('active_jobs','-')} / {sec.get('max_concurrent','-')} slots busy")
         + row("operator secret at rest", f"{sec.get('operator_secret',{}).get('state','unavailable')} "
